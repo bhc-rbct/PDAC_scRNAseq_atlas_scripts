@@ -1,0 +1,494 @@
+---
+title: "R Notebook"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+
+
+```{r}
+
+pacman::p_load(Seurat,
+               SeuratDisk,
+               dplyr,
+               DoubletFinder,
+               clustree,
+               lisi,
+               data.table,
+               ggplot2,
+               patchwork,
+               RColorBrewer,
+               ktplots,
+               pheatmap,
+               viridis)
+
+basedir <- "~/Projects/Johnsen_group/scRNA_seq/pancreas_hsap/GEO_datasets_raw/hg38_aligned/mad_ccDiff_decontX_norm_May26"
+
+# define function to automatically take PC cutoffs
+pc_cutoff <- function(sobj) {
+  # Determine percent of variation associated with each PC
+  pct <- sobj[["pca"]]@stdev / sum(sobj[["pca"]]@stdev) * 100
+  # Calculate cumulative percents for each PC
+  cumu <- cumsum(pct)
+  # Determine which PC exhibits cumulative percent greater than 90% and % variation associated with the PC as less than 5
+  co1 <- which(cumu > 90 & pct < 5)[1]
+  # Determine the difference between variation of PC and subsequent PC
+  # last point where change of % of variation is more than 0.1%.
+  co2 <- sort(which((pct[1:length(pct) - 1] - pct[2:length(pct)]) > 0.1), decreasing = T)[1] + 1
+  # Minimum of the two calculation
+  pcs <- min(co1, co2)
+  return(pcs)
+}
+
+options(future.globals.maxSize = 2e11)
+
+```
+
+### Read in datasets
+```{r}
+
+rdsfiles <- list.files(basedir, pattern = "RDS", full.names = T)
+
+slist <- vector(mode = "list", length = length(rdsfiles))
+names(slist) <- rdsfiles
+
+for (i in names(slist)) {
+  slist[[i]] <- readRDS(i)
+}
+names(slist) <- basename(names(slist)) %>% tstrsplit("_may26", keep = 1) %>% unlist()
+
+```
+
+
+```{r}
+
+seu <- merge(slist[[1]], slist[-1])
+
+seu[["RNA"]] <- JoinLayers(seu[["RNA"]])
+seu[["RNA"]] <- split(seu[["RNA"]], f = seu$sample_id)
+
+```
+
+
+```{r}
+
+seu <- seu %>% NormalizeData() %>%
+  FindVariableFeatures() %>%
+  ScaleData() %>%
+  RunPCA()
+
+
+pcs <- pc_cutoff(seu)
+
+seu <- FindNeighbors(seu, reduction = "pca", dims = 1:pcs)
+
+res <- seq(0.1, 1, 0.1)
+seu <- FindClusters(seu, resolution = res, algorithm = 4)
+
+clustree(seu)
+
+Idents(seu) <- "RNA_snn_res.0.2" 
+
+seu <- RunUMAP(seu, reduction = "pca", dims = 1:pcs, reduction.name = "umap.unintegrated")
+
+#DimPlot(seu, reduction = "unintegrated_snn_0.2")
+DimPlot(seu, reduction = "unintegrated_snn_0.2", group.by = "RNA_snn_res.0.2", raster = F)
+DimPlot(seu, reduction = "unintegrated_snn_0.2", group.by = "Type", raster = F)
+DimPlot(seu, reduction = "unintegrated_snn_0.2", group.by = "Project", raster = F)
+DimPlot(seu, reduction = "unintegrated_snn_0.2", group.by = "sample_id", raster = F)
+
+saveRDS(seu, file.path(basedir, "merged_projsplit_apr26.RDS"))
+
+# LISI
+emb_unintegrated_samp <- Embeddings(seu, reduction = "pca")
+meta_proj <- data.frame(Project = seu$Project, row.names = colnames(seu))
+
+lisi_unintegrated_proj <- compute_lisi(emb_unintegrated_samp, meta_proj, "Project")
+median(lisi_unintegrated_proj$Project)
+```
+
+
+### scVI integration by Project
+
+```{r}
+library(SeuratWrappers)
+
+Sys.unsetenv("PYTHONPATH")
+library(reticulate)
+use_python("/home/bou01pav/.conda/envs/scvi-env310/bin/python", required = TRUE)
+
+Sys.setenv(OMP_NUM_THREADS = "6", MKL_NUM_THREADS = "6", OPENBLAS_NUM_THREADS = "6")
+
+scvi <- import("scvi")
+scvi$settings$dl_num_workers <- 7L
+scvi$settings$num_threads <- 6L
+
+
+seu <- IntegrateLayers(
+  object = seu, method = scVIIntegration,
+  new.reduction = "integrated.scvi_proj",
+  conda_env = "~/.conda/envs/scvi-env310",
+  group.by.vars = "Project"
+)
+
+pcs <- pc_cutoff(seu)
+
+
+seu <- FindNeighbors(seu, reduction = "integrated.scvi_proj", dims = 1:pcs,
+                     graph.name = "scvi_proj_snn")
+
+res <- seq(0.1, 1, 0.1)
+seu <- FindClusters(seu, resolution = res, algorithm = 4, graph.name = "scvi_proj_snn")
+
+clustree(seu, prefix = "scvi_proj_snn_res.")
+
+Idents(seu) <- "scvi_proj_snn_res.0.4"
+
+seu <- RunUMAP(seu, reduction = "integrated.scvi_proj", dims = 1:pcs, reduction.name = "umap.scvi_proj")
+
+DimPlot(seu, reduction = "umap.scvi_proj", raster = F, group.by = "scvi_proj_snn_res.0.4") 
+DimPlot(seu, reduction = "umap.scvi_proj", group.by = "Project", raster = F)
+DimPlot(seu, reduction = "umap.scvi_proj", group.by = "Type", raster = F)
+DimPlot(seu, reduction = "umap.scvi_proj", group.by = "sample_id", raster = F)
+
+
+# LISI
+emb_scvi_proj <- Embeddings(seu, reduction = "integrated.scvi_proj")
+
+lisi_scvi_proj <- compute_lisi(emb_scvi_proj, meta_proj, "Project")
+median(lisi_scvi_proj$Project)
+```
+
+
+### scVI integration by sample_id
+
+```{r}
+
+seu[["RNA"]] <- JoinLayers(seu[["RNA"]])
+seu[["RNA"]] <- split(seu[["RNA"]], f = seu$sample_id)
+
+library(SeuratWrappers)
+
+
+Sys.unsetenv("PYTHONPATH")
+library(reticulate)
+use_python("/home/bou01pav/.conda/envs/scvi-env310/bin/python", required = TRUE)
+
+Sys.setenv(OMP_NUM_THREADS = "6", MKL_NUM_THREADS = "6", OPENBLAS_NUM_THREADS = "6")
+
+scvi <- import("scvi")
+scvi$settings$dl_num_workers <- 6L
+scvi$settings$num_threads <- 6L
+
+
+seu <- IntegrateLayers(
+  object = seu, method = scVIIntegration,
+  new.reduction = "integrated.scvi_samp",
+  conda_env = "~/.conda/envs/scvi-env310",
+  group.by.vars = "sample_id"
+)
+
+#pcs <- pc_cutoff(seu)
+
+
+seu <- FindNeighbors(seu, reduction = "integrated.scvi_samp", dims = 1:30,
+                     graph.name = "scvi_samp_snn")
+
+res <- seq(0.1, 1.5, 0.1)
+seu <- FindClusters(seu, resolution = res, algorithm = 4, graph.name = "scvi_samp_snn")
+
+clustree(seu, prefix = "scvi_samp_snn_res.")
+
+Idents(seu) <- "scvi_samp_snn_res.0.9"
+
+seu <- RunUMAP(seu, reduction = "integrated.scvi_samp", dims = 1:30, reduction.name = "umap.scvi_samp")
+
+
+DimPlot(seu, reduction = "umap.scvi_samp", raster = F, label = T, label.size = 3) + NoLegend()
+DimPlot(seu, reduction = "umap.scvi_samp", group.by = "Project", raster = F)
+DimPlot(seu, reduction = "umap.scvi_samp", group.by = "Type", raster = F)
+DimPlot(seu, reduction = "umap.scvi_samp", group.by = "sample_id", raster = F)
+
+
+# LISI
+emb_scvi_samp <- Embeddings(seu, reduction = "integrated.scvi_samp")
+
+lisi_scvi_samp_proj <- compute_lisi(emb_scvi_samp, meta_proj, "Project")
+print("Median lisi_project for scVI_samp_proj:\n")
+median(lisi_scvi_samp_proj$Project)
+```
+
+
+### Harmony integration by Project
+
+```{r}
+
+seu[["RNA"]] <- JoinLayers(seu[["RNA"]])
+seu[["RNA"]] <- split(seu[["RNA"]], f = seu$Project)
+
+seu <- IntegrateLayers(
+  object = seu, method = HarmonyIntegration,
+  orig.reduction = "pca", new.reduction = "harmony_proj",
+  group.by.vars = "Project",
+  theta = 2
+)
+
+pcs <- pc_cutoff(seu)
+
+seu <- FindNeighbors(seu, reduction = "harmony_proj", dims = 1:pcs,
+                     graph.name = "harmony_proj_snn")
+
+res <- seq(0.1, 1, 0.1)
+seu <- FindClusters(seu, resolution = res, algorithm = 4, graph.name = "harmony_proj_snn")
+
+clustree(seu, prefix = "harmony_proj_snn_res.")
+
+Idents(seu) <- "harmony_proj_snn_res.0.5"
+
+seu <- RunUMAP(seu, reduction = "harmony_proj", dims = 1:pcs, reduction.name = "umap.harmony_proj")
+
+DimPlot(seu, reduction = "umap.harmony_proj", raster = F, group.by = "harmony_proj_snn_res.0.5")
+DimPlot(seu, reduction = "umap.harmony_proj", group.by = "Project", raster = F)
+DimPlot(seu, reduction = "umap.harmony_proj", group.by = "Type", raster = F)
+DimPlot(seu, reduction = "umap.harmony_proj", group.by = "sample_id", raster = F)
+
+
+# LISI
+emb_harmony_proj <- Embeddings(seu, reduction = "harmony_proj")
+
+lisi_harmony_proj <- compute_lisi(emb_harmony_proj, meta_proj, "Project")
+median(lisi_harmony_proj$Project)
+```
+
+
+### Harmony integration by sample_id
+
+```{r}
+seu <- IntegrateLayers(
+  object = seu, method = HarmonyIntegration,
+  orig.reduction = "pca", new.reduction = "harmony_samp",
+  group.by.vars = "sample_id",
+  theta = 2
+)
+
+pcs <- pc_cutoff(seu)
+
+seu <- FindNeighbors(seu, reduction = "harmony_samp", dims = 1:pcs,
+                     graph.name = "harmony_samp_snn")
+
+res <- seq(0.1, 1, 0.1)
+seu <- FindClusters(seu, resolution = res, algorithm = 4, graph.name = "harmony_samp_snn")
+
+library(clustree)
+clustree(seu, prefix = "harmony_samp_snn_res.")
+
+Idents(seu) <- "harmony_samp_snn_res.0.5"
+
+seu <- RunUMAP(seu, reduction = "harmony_samp", dims = 1:pcs, reduction.name = "umap.harmony_samp")
+
+DimPlot(seu, reduction = "umap.harmony_samp", raster = F, group.by = "harmony_samp_snn_res.0.5")
+DimPlot(seu, reduction = "umap.harmony_samp", group.by = "Project", raster = F)
+DimPlot(seu, reduction = "umap.harmony_samp", group.by = "Type", raster = F)
+DimPlot(seu, reduction = "umap.harmony_samp", group.by = "sample_id", raster = F)
+
+
+# LISI
+emb_harmony_samp <- Embeddings(seu, reduction = "harmony_samp")
+
+lisi_harmony_samp_proj <- compute_lisi(emb_harmony_samp, meta_proj, "Project")
+median(lisi_harmony_samp_proj$Project)
+```
+
+
+# Score integrations
+
+```{r}
+
+# library(kBET)
+# kbet_res <- kBET(emb, seu$Patient3)
+# kbet_res$stats$mean_type
+
+# silhouette metric
+library(cluster, quietly = TRUE)
+
+get_silhouette <- function (dataset, reduction, variable) {
+  dist.matrix <- dist(x = Embeddings(object = dataset[[reduction]])[, dims])
+  clusters <- dataset[[variable]]
+  sil <- silhouette(x = as.numeric(x = as.factor(x = clusters)), dist = dist.matrix)
+}
+
+dataset$sil <- sil[, 3]
+
+# mixing metric
+max.k <- 300
+mm <- max.k - MixingMetric(object = dataset, grouping.var = "replicate", reduction = reduction, dims = dims, max.k = max.k)
+```
+
+```{r}
+PRJCA001063_annotated <- readRDS("~/Projects/Johnsen_group/spatial_transcriptomics/xenium/human_pancreas/GEO_datasets/scRNA/PRJCA001063/PRJCA001063_annotated.RDS")
+PRJCA001063_annotated <- PRJCA001063_annotated %>% NormalizeData() %>% FindVariableFeatures() %>% ScaleData() %>% RunPCA()
+
+# Find transfer anchors
+anchors <- FindTransferAnchors(
+  reference = PRJCA001063_annotated,    
+  query = seu,          
+  dims = 1:19,            
+  reduction = "pcaproject",
+  project.query = T)
+
+# Transfer labels
+predictions <- TransferData(
+  anchors = anchors,           
+  refdata = PRJCA001063_annotated$dblabel, 
+  dims = 1:13                  # Dimensions to use for transferring
+)
+
+# Add predictions to the query dataset
+seu <- AddMetaData(seu, metadata = predictions)
+
+Idents(seu) <- "seurat_clusters"  # or _nmi
+DefaultAssay(seu) <- "RNA"
+
+meta_c <- data.frame(predicted.id = seu$predicted.id, row.names=colnames(seu))
+clisi_res <- compute_lisi(emb, meta_c, "predicted.id")
+
+
+DimPlot(seu, group.by = "predicted.id", reduction = "umap.scvi2p.0.5")
+```
+
+```{r}
+gsigdir <- "~/Projects/Johnsen_group/spatial_transcriptomics/xenium/human_pancreas/gene_signatures"
+
+chen_cafs <- fread(file.path(gsigdir, "cafs_chen2021.tsv"))
+
+```
+
+
+```{r}
+seu_joined <- seu
+seu_joined[["RNA"]] <- JoinLayers(seu[["RNA"]])
+```
+
+
+```{r}
+######## Ductal subclustering (Peng)
+ductsub <- subset(seu_joined, subset = predicted.id == "pancreatic ductal cell") 
+counts_matrix <- GetAssayData(seu_joined, assay = "RNA", layer = "counts")[, colnames(ductsub)]
+ductsub[["RNA"]] <- CreateAssay5Object(counts = counts_matrix)
+
+ductsub <- ductsub %>% NormalizeData() %>% 
+  FindVariableFeatures() %>% 
+  ScaleData() %>% RunPCA()
+
+#pcs <- pc_cutoff(ductsub)
+
+ductsub <- FindNeighbors(ductsub, dims = 1:10, reduction = "integrated.scvi_patient3",
+                         graph.name = "dsub")
+
+res <- seq(0.1, 0.8, 0.1)
+ductsub <- FindClusters(ductsub, resolution = res, algorithm = 4,
+                        graph.name = "dsub")
+
+clustree(ductsub, prefix = "dsub_res.")
+
+Idents(ductsub) <- "dsub_res.0.2"
+ductsub <- RunUMAP(ductsub, dims = 1:10, reduction = "integrated.scvi_patient3",
+                   reduction.name = "dsub_umap")
+
+
+pal3 <- DiscretePalette(17, 'polychrome')
+DimPlot(ductsub, cols = pal3, reduction = "dsub_umap")
+
+DotPlot(ductsub, features = c("Ductal1", "Ductal2", "Acinar", "PanIn", "Classical_CSY", "Basal_CSY"), 
+        cols = "RdBu", group.by = "dsub_res.0.2")
+
+FeaturePlot(ductsub, features = c("Classical_CSY", "Basal_CSY"), reduction = "dsub_umap",
+            cols = c("lightgray", "red3"), min.cutoff = "q9", raster = F)
+
+FeaturePlot(ductsub, features = c("Acinar", "Ductal1", "Ductal2", "PanIn"), reduction = "dsub_umap",
+            cols = c("lightgray", "red3"), min.cutoff = "q9", raster = F)
+
+FeaturePlot(ductsub, features = c("Classical_CSY", "Basal_CSY"), raster = F,
+            cols = c("beige", "blue3", "red3"), blend = TRUE, reduction = "dsub_umap")
+```
+
+```{r}
+######## Fibroblast subclustering (Peng predicted.id)
+fibrosub <- subset(seu_joined, subset = predicted.id == "fibroblast") 
+counts_matrix <- GetAssayData(seu_joined, assay = "RNA", layer = "counts")[, colnames(fibrosub)]
+fibrosub[["RNA"]] <- CreateAssay5Object(counts = counts_matrix)
+
+ fibrosub <- fibrosub %>% NormalizeData() %>% 
+  FindVariableFeatures() %>% 
+  ScaleData() %>% RunPCA()
+
+#pcs <- pc_cutoff(fibrosub)
+
+fibrosub <- FindNeighbors(fibrosub, dims = 1:10, reduction = "integrated.scvi_patient3",
+                          graph.name = "fsub")
+
+res <- seq(0.1, 0.8, 0.1)
+fibrosub <- FindClusters(fibrosub, resolution = res, algorithm = 4,
+                         graph.name = "fsub")
+
+clustree(fibrosub, prefix = "fsub_res.")
+
+Idents(fibrosub) <- "fsub_res.0.3"
+fibrosub <- RunUMAP(fibrosub, dims = 1:10, reduction = "integrated.scvi_patient3",
+                    reduction.name = "fsub_umap")
+
+#pal3 <- DiscretePalette(7, 'polychrome')
+DimPlot(fibrosub, reduction = "fsub_umap", label = T) + NoLegend()
+
+DotPlot(fibrosub, features = c("panCAF", "myCAF", "iCAF", "apCAF"), 
+        cols = "RdBu")
+
+FeaturePlot(fibrosub, features = c("panCAF", "myCAF", "iCAF", "apCAF", "Stellate"), reduction = "fsub_umap",
+            cols = c("lightgrey", "red3"), min.cutoff = "q9")
+
+FeaturePlot(fibrosub, features = c("cCAF", "csCAF", "PSC"), reduction = "fsub_umap",
+            cols = c("lightgrey", "red3"), min.cutoff = "q9")
+```
+
+
+```{r}
+######## T-Cell subclustering (Peng)
+Idents(seu_joined) <- "predicted.id"
+tsub <- subset(seu_joined, idents == c("CD8-positive, alpha-beta cytotoxic T cell",
+                                       "central memory CD4-positive, alpha-beta T cell",
+                                        "proliferating CD8-positive, alpha-beta T cell",
+                                        "regulatory T cell"), invert = T) 
+counts_matrix <- GetAssayData(seu_joined, assay = "RNA", layer = "counts")[, colnames(tsub)]
+tsub[["RNA"]] <- CreateAssay5Object(counts = counts_matrix)
+
+tsub <- tsub %>% NormalizeData() %>% 
+  FindVariableFeatures() %>% 
+  ScaleData() %>% RunPCA()
+
+#pcs <- pc_cutoff(tsub)
+
+tsub <- FindNeighbors(tsub, dims = 1:10, reduction = "integrated.scvi_patient3",
+                         graph.name = "dsub")
+
+res <- seq(0.1, 0.8, 0.1)
+tsub <- FindClusters(tsub, resolution = res, algorithm = 4,
+                        graph.name = "dsub")
+
+clustree(tsub, prefix = "dsub_res.")
+
+Idents(tsub) <- "dsub_res.0.2"
+tsub <- RunUMAP(tsub, dims = 1:10, reduction = "integrated.scvi_patient3",
+                   reduction.name = "dsub_umap")
+
+
+pal3 <- DiscretePalette(17, 'polychrome')
+DimPlot(tsub, cols = pal3, reduction = "dsub_umap")
+
+FeaturePlot(tsub, features = c("Classical_CSY", "Basal_CSY"), reduction = "dsub_umap",
+            cols = c("lightgray", "red3"), min.cutoff = "q9", raster = F)
+
+FeaturePlot(tsub, features = c("Classical_CSY", "Basal_CSY"), raster = F,
+            cols = c("beige", "blue3", "red3"), blend = TRUE, reduction = "dsub_umap")
+```
+
+
