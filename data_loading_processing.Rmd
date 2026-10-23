@@ -1,0 +1,871 @@
+---
+title: "GSE scRNA dataset pre-processing"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+
+
+## Setup
+
+```{r}
+
+# load required packages
+pacman::p_load(Seurat,
+               SeuratDisk,
+               clustree,
+               dplyr,
+               decontX,
+               SingleCellExperiment,
+               DropletUtils,
+               DoubletFinder,
+               data.table,
+               ggplot2,
+               glmGamPoi,
+               patchwork,
+               RColorBrewer,
+               ktplots,
+               viridis)
+
+
+# set working directory and chunk opts
+basedir <- "~/Projects/Johnsen_group/scRNA_seq/pancreas_hsap/GEO_datasets_raw/hg38_aligned"
+setwd(basedir)
+knitr::opts_chunk$set(root.dir = basedir, fig.width = 13, warning = F, include = F)
+
+
+# read in multiplet rate reference (from 10x)
+mrates <- data.table::fread("~/Reference/multiplets_vs_cells_10x_ref.tsv")
+
+# define a function to auto-filter nFeatures/nCounts/percent.mt based on MADs
+is_outlier <- function(seurat_obj, metric, nmads = 3) {
+  M <- seurat_obj@meta.data[[metric]]
+  med <- median(M, na.rm = TRUE)
+  mad_val <- mad(M, constant = 1, na.rm = TRUE)
+  outlier <- (M < med - nmads * mad_val) | (M > med + nmads * mad_val)
+  return(outlier)
+}
+
+# is_outlier_mt <- function(seurat_obj, metric, nmads = 3) {
+#   M <- seurat_obj@meta.data[[metric]]
+#   med <- median(M, na.rm = TRUE)
+#   mad_val <- mad(M, constant = 1, na.rm = TRUE)
+#   upper_lim <- min(25, med + nmads * mad_val) 
+#   outlier <- M > upper_lim
+#   return(outlier)
+# }
+
+# define function to automatically take PC cutoffs, add 1
+pc_cutoff <- function(sobj) {
+  # Determine percent of variation associated with each PC
+  pct <- sobj[["pca"]]@stdev / sum(sobj[["pca"]]@stdev) * 100
+  # Calculate cumulative percents for each PC
+  cumu <- cumsum(pct)
+  # Determine which PC exhibits cumulative percent greater than 90% and
+  ## % variation associated with the PC as less than 5
+  co1 <- which(cumu > 90 & pct < 5)[1]
+  # Determine the difference between variation of PC and subsequent PC
+  # last point where change of % of variation is more than 0.1%.
+  co2 <- sort(which((pct[1:length(pct) - 1] - pct[2:length(pct)]) > 0.1), decreasing = T)[1] + 1
+  # Minimum of the two calculation
+  pcs <- min(co1, co2)
+  return(pcs + 1)
+}
+
+
+## Define a function to filter seurat obj and remove doublets
+filt_sobj <- function(sobj, assay_name = DefaultAssay(sobj),
+                      nmads=5, nmads_mt=3, perc_mt=25) {
+
+  require(DoubletFinder)
+
+  sobj$nFeature_RNA_outlier <- is_outlier(sobj, "nFeature_RNA", 5)
+  cat(sprintf("Number of nFeature_RNA outliers @ %d mads: %d",
+              nmads, sum(sobj$nFeature_RNA_outlier)))
+  sobj$nCount_RNA_outlier <- is_outlier(sobj, "nCount_RNA", 5)
+  cat(sprintf("\nNumber of nCount_RNA outliers @ %d mads: %d",
+          nmads, sum(sobj$nCount_RNA_outlier)))
+  # sobj$percent_MT_outlier <- is_outlier_mt(sobj, "percent_MT", 3)
+  # cat(sprintf("\nNumber of percent_MT outliers @ %d mads: %d)",
+  #             nmads_mt, sum(sobj$percent_MT_outlier)))
+
+  cat(sprintf("\nCells pre-filter: %d\n", ncol(sobj)))
+  # if (!is.na(sum(sobj$percent_MT_outlier))) {
+  #   sobj <- subset(sobj, subset = percent_MT_outlier == F)
+  # }
+  sobj <- subset(sobj, subset = percent_MT < 25)
+  sobj <- subset(sobj, subset = nFeature_RNA_outlier == F | nCount_RNA_outlier == F)
+  cat(sprintf("\nCells post-filter: %d\n", ncol(sobj)))
+
+  sobj <- sobj %>% NormalizeData() %>% FindVariableFeatures() %>% ScaleData() 
+
+  if (ncol(sobj) <= 50) {
+    sobj <- RunPCA(sobj, npcs = 30)
+  } else {sobj <- RunPCA(sobj)}
+
+  pcs <- pc_cutoff(sobj)
+
+  # Parameter sweep for optimal pK
+  sweep.res.list <- paramSweep(sobj, PCs = 1:pcs, sct = F)
+  sweep.stats <- summarizeSweep(sweep.res.list, GT = FALSE)
+  bcmvn <- find.pK(sweep.stats)
+
+  # Selecting optimal pK based on the maximum BCmetric
+  optimal.pK <- as.numeric(as.character(bcmvn$pK[which.max(bcmvn$BCmetric)]))
+
+  # get doublet estimation based on refs
+  mrates_lm <- lm(multiplet_rate ~ cells_recovered, data = mrates)
+  mrate_pred <- predict(mrates_lm, data.frame(cells_recovered = ncol(sobj))) %>%
+    round(digits = 2) / 100
+
+  # Estimate the expected number of doublets
+  nExp_poi <- round(mrate_pred * nrow(sobj@meta.data))
+
+  # Run DoubletFinder
+  sobj <- doubletFinder(sobj, PCs = 1:pcs, pN = 0.25, sct = F,
+                        pK = optimal.pK, nExp = nExp_poi, reuse.pANN = NULL)
+  # Assigning column names in a vector
+  column_names <- colnames(sobj@meta.data)
+
+  # Set idents as the doublet status within the seurat_sample
+  ident_col <- grep("DF.classifications", colnames(sobj@meta.data), value = TRUE)
+  Idents(sobj) <- column_names[which(column_names == ident_col)]
+
+  # Subset the seurat_sample to contain only singlets
+  sobj <- subset(sobj, idents = 'Singlet')
+  return(sobj)
+  gc()
+}
+
+
+## function to remove ambient RNA contamination
+run_decontX <- function(seu_obj) {
+  cat("Inital cell count:", ncol(seu_obj), "\n")
+  counts <- LayerData(seu_obj, assay = "RNA", layer = "counts")
+  sce <- SingleCellExperiment(assays = list(counts = counts))
+  sce <- decontX(sce)
+  
+  # Add decontXcounts assay (rounded integers)
+  decont_counts <- round(decontXcounts(sce))
+  seu_obj[["RNA_raw"]] <- seu_obj[["RNA"]]
+  seu_obj[["RNA"]] <- CreateAssay5Object(counts = decont_counts)
+  
+  # Add contamination metadata
+  seu_obj$decontX_contamination <- colData(sce)$decontX_contamination
+  
+  # Filter high contamination (>0.3; tune based on VlnPlot)
+  seu_obj <- subset(seu_obj, subset = decontX_contamination < 0.3)
+  
+  cat("Cells kept:", ncol(seu_obj), "\n")
+  return(seu_obj)
+}
+
+options(future.globals.maxSize = 2e11)
+```
+
+
+## Dataset filtering and processing
+### GSE111672
+```{r}
+
+# list the raw files
+dir_gse111672 <- file.path(basedir, "GSE111672/RAW")
+filenames <- list.files(dir_gse111672,
+                         pattern = "PDAC-A|PDAC-B|PDAC-C", full.names = T)
+gse111672_list <- vector("list", length = length(filenames))
+names(gse111672_list) <- filenames
+
+# read the files into a list
+for (i in names(gse111672_list)) {
+  gse111672_list[[i]] <- read.delim(i, sep = "\t", row.names = 1)
+}
+names(gse111672_list) <- tstrsplit(basename(names(gse111672_list)), "\\.", keep = 1) %>% 
+  unlist() 
+
+# Create Seurat objects in list, rename cells, and run decontX
+for (j in names(gse111672_list)) {
+  gse111672_list[[j]] <- CreateSeuratObject(gse111672_list[[j]],
+                                       project = names(gse111672_list[j]),
+                                       min.cells = 3, min.features = 200)
+  gse111672_list[[j]]$orig.ident <- unlist(tstrsplit(j, "_", keep = 1))
+  gse111672_list[[j]] <- PercentageFeatureSet(gse111672_list[[j]], 
+                                              pattern = "^MT-",
+                                              col.name = "percent_MT")
+  gse111672_list[[j]] <- RenameCells(gse111672_list[[j]], add.cell.id = j)
+  gse111672_list[[j]] <- run_decontX(gse111672_list[[j]])
+}
+
+# check pre-filter metrics
+VlnPlot(merge(x=gse111672_list[[1]], y=gse111672_list[-1]), 
+        features = c("nFeature_RNA", "nCount_RNA", "percent_MT"),
+        group.by = "orig.ident")
+
+# filtering
+gse111672_list_filt <- lapply(gse111672_list, filt_sobj)
+
+# merge and check post-filter metrics
+gse111672_merge <- merge(gse111672_list_filt[[1]], gse111672_list_filt[-1])
+VlnPlot(gse111672_merge, features = c("nFeature_RNA", "nCount_RNA", "percent_MT"),
+        group.by = "orig.ident")
+
+
+# edit metadata
+gse111672_merge@meta.data <- gse111672_merge@meta.data[, !grepl("^(DF\\.classifications|pANN)", 
+                                                                colnames(gse111672_merge@meta.data))]
+
+gse111672_merge$Project <- "GSE111672"
+sample_id <- unlist(tstrsplit(rownames(gse111672_merge@meta.data), "_cell", keep=1))
+gse111672_merge$sample_id <- paste(gse111672_merge$Project, sample_id, sep = "_")
+gse111672_merge$Type <- "Tumor"
+gse111672_merge$Method <- "NextSeq_500"
+
+saveRDS(gse111672_merge, file.path(basedir, "mad_filt_stdNorm_decontX_Apr26/gse111672_apr26.RDS")) 
+rm(dir_gse111672, gse111672_list, gse111672_list_filt)
+gc()
+
+################################################################################\
+
+seu <- gse111672_merge %>% NormalizeData() %>% FindVariableFeatures() %>% 
+  ScaleData() %>% RunPCA()
+
+res <- seq(0.1, 1, 0.1)
+pcs <- pc_cutoff(seu)
+
+seu <- seu %>% FindNeighbors(reduction = "pca", dims = 1:pcs) %>%
+  FindClusters(resolution = res, algorithm = 4)
+
+clustree(seu)
+
+Idents(seu) <- "RNA_snn_res.0.4" 
+
+seu <- RunUMAP(seu, reduction = "pca", dims = 1:pcs, 
+               reduction.name = "unintegrated")
+
+DimPlot(seu, reduction = "unintegrated", 
+        group.by = c("RNA_snn_res.0.4", "sample_id"))
+
+rm(gse111672_merge, seu)
+gc()
+```
+
+
+### GSE156405
+
+```{r}
+dir_gse156405 <- file.path(basedir, "GSE156405/data")
+filenames <- dir(dir_gse156405, recursive = F, include.dirs = T, full.names = T,
+                 pattern = "^GSM")
+
+gse156405_list <- vector("list", length = length(filenames))
+names(gse156405_list) <- filenames
+
+for(i in filenames){
+  gse156405_list[[i]] <- Read10X(data.dir = i)
+}
+names(gse156405_list) <- basename(names(gse156405_list))
+
+
+## Create Seurat objects
+for(i in names(gse156405_list)){
+  gse156405_list[[i]] <- CreateSeuratObject(counts = gse156405_list[[i]],
+                                       project = names(gse156405_list[i]),
+                                       min.cells = 3, min.features = 200)
+  gse156405_list[[i]] <- RenameCells(gse156405_list[[i]], add.cell.id = i)
+  gse156405_list[[i]] <- PercentageFeatureSet(gse156405_list[[i]], 
+                                              pattern = "^MT-",
+                                              col.name = "percent_MT")
+  gse156405_list[[i]] <- run_decontX(gse156405_list[[i]])
+}
+
+VlnPlot(merge(gse156405_list[[1]], gse156405_list[-1]),
+        features = c("nFeature_RNA", "nCount_RNA", "percent_MT"),
+        group.by = "orig.ident")
+
+# filtering
+gse156405_list_filt <- lapply(gse156405_list, filt_sobj)
+
+
+# merge
+gse156405_merge <- merge(gse156405_list_filt[[1]], gse156405_list_filt[-1])
+VlnPlot(gse156405_merge,
+        features = c("nFeature_RNA", "nCount_RNA", "percent_MT"),
+        group.by = "orig.ident")
+
+## edit meta data
+gse156405_merge@meta.data <- gse156405_merge@meta.data[, !grepl("^(DF\\.classifications|pANN)", 
+                                                                colnames(gse156405_merge@meta.data))]
+gse156405_merge$Project <- "GSE156405"
+gse156405_merge$sample_id <- paste(gse156405_merge$Project, gse156405_merge$orig.ident, sep ="_")
+gse156405_merge$Type <- "Tumor"
+gse156405_merge$Method <- "NextSeq_500"
+
+#saveRDS(gse154778_list, file = file.path(basedir, "Feb26_preprocessed_decontX/lists/list_gse154778_singlets_Nov25.rds"))
+saveRDS(gse156405_merge, file = file.path(basedir, "mad_filt_stdNorm_decontX_Apr26/gse156405_apr26.RDS"))
+rm(dir_gse156405, filenames, i, gse156405_list, gse156405_list_filt)
+gc()
+
+################################################################################\
+
+
+seu <- gse156405_merge %>% NormalizeData() %>% FindVariableFeatures() %>% 
+  ScaleData() %>% RunPCA()
+
+pcs <- pc_cutoff(seu)
+
+res <- seq(0.1, 1, 0.1)
+seu <- seu %>% FindNeighbors(reduction = "pca", dims = 1:pcs) %>%
+  FindClusters(resolution = res, algorithm = 4)
+
+clustree(seu)
+
+Idents(seu) <- "RNA_snn_res.0.4" 
+
+seu <- RunUMAP(seu, reduction = "pca", dims = 1:pcs, 
+               reduction.name = "unintegrated")
+
+DimPlot(seu, reduction = "unintegrated", 
+        group.by = c("RNA_snn_res.0.4", "sample_id"))
+
+rm(gse156405_merge, seu)
+gc()
+```
+
+
+### GSE197177
+
+```{r}
+dir_gse197177 <- file.path(basedir, "GSE197177")
+filenames <- dir(dir_gse197177, recursive = F, include.dirs = T, full.names = T,
+                 pattern = "^GSM")
+
+gse197177_list <- vector("list", length = length(filenames))
+names(gse197177_list) <- filenames
+
+for(i in filenames){
+  gse197177_list[[i]] <- Read10X(data.dir = i)
+}
+names(gse197177_list) <- basename(names(gse197177_list))
+
+
+## Create Seurat objects
+for(i in names(gse197177_list)){
+  gse197177_list[[i]] <- CreateSeuratObject(counts = gse197177_list[[i]],
+                                       project = names(gse197177_list[i]),
+                                       min.cells = 3, min.features = 200)
+  gse197177_list[[i]] <- RenameCells(gse197177_list[[i]], add.cell.id = i)
+  gse197177_list[[i]] <- PercentageFeatureSet(gse197177_list[[i]], 
+                                              pattern = "^MT-",
+                                              col.name = "percent_MT")
+  if (i %like% "PDAC") {
+      gse197177_list[[i]]$Type <- "Tumor"
+    } else if (i %like% "Norm"){
+      gse197177_list[[i]]$Type <- "Normal"
+    }
+  gse197177_list[[i]] <- run_decontX(gse197177_list[[i]])
+}
+
+VlnPlot(merge(gse197177_list[[1]], gse197177_list[-1]),
+        features = c("nFeature_RNA", "nCount_RNA", "percent_MT"),
+        group.by = "orig.ident")
+
+# filtering
+gse197177_list_filt <- lapply(gse197177_list, filt_sobj)
+
+
+# merge
+gse197177_merge <- merge(gse197177_list_filt[[1]], gse197177_list_filt[-1])
+VlnPlot(gse197177_merge,
+        features = c("nFeature_RNA", "nCount_RNA", "percent_MT"),
+        group.by = "orig.ident")
+
+## edit meta data
+gse197177_merge@meta.data <- gse197177_merge@meta.data[, !grepl("^(DF\\.classifications|pANN)", 
+                                                                colnames(gse197177_merge@meta.data))]
+gse197177_merge$Project <- "GSE197177"
+gse197177_merge$sample_id <- paste(gse197177_merge$Project, gse197177_merge$orig.ident, sep = "_")
+gse197177_merge$Method <- "NextSeq_500"
+
+#saveRDS(gse154778_list, file = file.path(basedir, "Feb26_preprocessed_decontX/lists/list_gse154778_singlets_Nov25.rds"))
+saveRDS(gse197177_merge, file = file.path(basedir, "mad_filt_stdNorm_decontX_Apr26/gse197177_apr26.RDS"))
+rm(dir_gse197177, filenames, i, gse197177_list, gse197177_list_filt)
+gc()
+
+################################################################################\
+
+seu <- gse197177_merge %>% NormalizeData() %>% FindVariableFeatures() %>% 
+  ScaleData() %>% RunPCA()
+
+pcs <- pc_cutoff(seu)
+
+res <- seq(0.1, 1, 0.1)
+seu <- seu %>% FindNeighbors(reduction = "pca", dims = 1:pcs) %>%
+  FindClusters(resolution = res, algorithm = 4)
+
+clustree(seu)
+
+Idents(seu) <- "RNA_snn_res.0.5" 
+
+seu <- RunUMAP(seu, reduction = "pca", dims = 1:pcs, 
+               reduction.name = "unintegrated")
+
+DimPlot(seu, reduction = "unintegrated", 
+        group.by = c("RNA_snn_res.0.5", "sample_id"))
+
+rm(gse197177_merge, seu)
+gc()
+```
+
+
+### GSE205013
+
+```{r}
+
+# get 10x directories/input
+dir_gse205013 <- file.path(basedir, "GSE205013")
+filename <- dir(dir_gse205013, recursive = F, full.names = T, include.dirs = T,
+                pattern = "^GSM")
+gse205013_list <- vector("list", length = length(filename))
+names(gse205013_list) <- filename
+
+# Read in 10x data into a list and add sample names
+for(i in filename){
+  gse205013_list[[i]] <- Read10X(data.dir = i)
+}
+names(gse205013_list) <- basename(names(gse205013_list))
+
+# Create Seurat objects in list, add pct MT, rename cells, and run decontX
+for(i in names(gse205013_list)){
+  gse205013_list[[i]] <- CreateSeuratObject(counts = gse205013_list[[i]], 
+                                            project = names(gse205013_list[i]), 
+                                            min.cells = 3, min.features = 200)
+  gse205013_list[[i]] <- PercentageFeatureSet(gse205013_list[[i]], 
+                                              pattern = "^MT-",
+                                              col.name = "percent_MT")
+  gse205013_list[[i]] <- RenameCells(gse205013_list[[i]], add.cell.id = i)
+  gse205013_list[[i]] <- run_decontX(gse205013_list[[i]])
+}
+
+# check pre-filter metrics
+VlnPlot(merge(x=gse205013_list[[1]], y=gse205013_list[-1]), 
+        features = c("nFeature_RNA", "nCount_RNA", "percent_MT"),
+        group.by = "orig.ident")
+
+# filtering 
+gse205013_list_filt <- lapply(gse205013_list, filt_sobj)
+
+# merge list objects and check post-filter metrics
+gse205013_merge <- merge(x=gse205013_list_filt[[1]], y=gse205013_list_filt[-1])
+VlnPlot(gse205013_merge, features = c("nFeature_RNA", "nCount_RNA", "percent_MT"),
+        group.by = "orig.ident")
+
+# edit metadata
+gse205013_merge@meta.data <- gse205013_merge@meta.data[, !grepl("^(DF\\.classifications|pANN)", 
+                                                                colnames(gse205013_merge@meta.data))]
+gse205013_merge$Project <- "GSE205013"
+gse205013_merge$sample_id <- paste(gse205013_merge$Project, gse205013_merge$orig.ident, sep = "_")
+gse205013_merge$Type <- "Tumor"
+gse205013_merge$Method <- "NovaSeq_6000"
+
+
+saveRDS(gse205013_merge, file.path(basedir, "mad_filt_stdNorm_decontX_Apr26/gse205013_apr26.RDS"))
+rm(dir_gse205013, gse205013_list_filt, gse205013_list)
+gc()
+
+################################################################################\
+
+seu <- gse205013_merge %>% NormalizeData() %>% FindVariableFeatures() %>% 
+  ScaleData() %>% RunPCA()
+
+pcs <- pc_cutoff(seu)
+
+res <- seq(0.1, 1, 0.1)
+seu <- seu %>% FindNeighbors(reduction = "pca", dims = 1:pcs) %>%
+  FindClusters(resolution = res, algorithm = 4)
+
+clustree(seu)
+
+Idents(seu) <- "RNA_snn_res.0.2" 
+
+seu <- RunUMAP(seu, reduction = "pca", dims = 1:pcs, 
+               reduction.name = "unintegrated")
+
+DimPlot(seu, reduction = "unintegrated", 
+        group.by = c("RNA_snn_res.0.2", "sample_id"))
+
+rm(gse205013_merge, seu)
+gc()
+```
+
+
+### GSE229413
+
+```{r}
+# get 10x directories/input
+gse229413_dir <- file.path(basedir, "GSE229413")
+filenames <- dir(gse229413_dir, pattern = "_filtered_feature_bc_matrix.h5", all.files = T,
+                full.names = T, recursive = T)
+gse229413_list <- vector("list", length = length(filenames))
+names(gse229413_list) <- filenames
+
+# Read in 10x data into a list and add sample names
+for(i in filenames){
+  gse229413_list[[i]] <- Read10X_h5(i)
+}
+names(gse229413_list) <- unlist(tstrsplit(basename(names(gse229413_list)), "_", keep = 1))
+
+# Create Seurat objects in list, add pct MT, rename cells, and run decontX
+for(i in names(gse229413_list)){
+  gse229413_list[[i]] <- CreateSeuratObject(counts = gse229413_list[[i]], 
+                                       project = names(gse229413_list[i]), 
+                                       min.cells = 3, min.features = 200)
+  gse229413_list[[i]] <- PercentageFeatureSet(gse229413_list[[i]], 
+                                              pattern = "^MT-",
+                                              col.name = "percent_MT")
+  gse229413_list[[i]] <- RenameCells(gse229413_list[[i]], add.cell.id = i)
+  gse229413_list[[i]] <- run_decontX(gse229413_list[[i]])
+}
+
+# check pre-filter metrics
+VlnPlot(merge(x=gse229413_list[[1]], y=gse229413_list[-1]), 
+        features = c("nFeature_RNA", "nCount_RNA", "percent_MT"))
+
+# filtering
+gse229413_list_filt <- lapply(gse229413_list, filt_sobj)
+
+# add patient metadata
+#names(gse229413_list_filt) <- unlist(tstrsplit(names(gse229413_list_filt), "_", keep =1))
+gse229413_list_filt$GSM7162998$Patient <- "Donor_1_head_and_tail"; gse229413_list_filt$GSM7162998$Type <- "Normal"
+gse229413_list_filt$GSM7162999$Patient <-  "Donor_2_head"; gse229413_list_filt$GSM7162999$Type <- "Normal"
+gse229413_list_filt$GSM7163000$Patient <-  "Donor_2_tail"; gse229413_list_filt$GSM7163000$Type <- "Normal"
+gse229413_list_filt$GSM7163001$Patient <-  "Donor_4_head"; gse229413_list_filt$GSM7163001$Type <- "Normal"
+gse229413_list_filt$GSM7163002$Patient <-  "Donor_4_tail"; gse229413_list_filt$GSM7163002$Type <- "Normal"
+gse229413_list_filt$GSM7163003$Patient <-  "Donor_5_head"; gse229413_list_filt$GSM7163003$Type <- "Normal"
+gse229413_list_filt$GSM7163004$Patient <-  "Donor_5_tail"; gse229413_list_filt$GSM7163004$Type <- "Normal"
+gse229413_list_filt$GSM7163005$Patient <-  "Donor_6_head"; gse229413_list_filt$GSM7163005$Type <- "Normal"
+gse229413_list_filt$GSM7163006$Patient <-  "Donor_6_tail"; gse229413_list_filt$GSM7163006$Type <- "Normal"
+gse229413_list_filt$GSM7163007$Patient <-  "Donor_8_head"; gse229413_list_filt$GSM7163007$Type <- "Normal"
+gse229413_list_filt$GSM7163008$Patient <-  "Donor_8_tail"; gse229413_list_filt$GSM7163008$Type <- "Normal"
+gse229413_list_filt$GSM7163009$Patient <-  "Donor_9_head"; gse229413_list_filt$GSM7163009$Type <- "Normal"
+gse229413_list_filt$GSM7163010$Patient <-  "Donor_9_tail"; gse229413_list_filt$GSM7163010$Type <- "Normal"
+gse229413_list_filt$GSM7277524$Patient <-  "181429Tumor"; gse229413_list_filt$GSM7277524$Type <- "Tumor"
+gse229413_list_filt$GSM7277525$Patient <-  "19_227PancNorm"; gse229413_list_filt$GSM7277525$Type <- "Normal"
+gse229413_list_filt$GSM7277526$Patient <-  "19_732PancNorm"; gse229413_list_filt$GSM7277526$Type <- "Normal"
+gse229413_list_filt$GSM7277527$Patient <-  "61353210Tumor"; gse229413_list_filt$GSM7277527$Type <- "Tumor"
+gse229413_list_filt$GSM7277528$Patient <-  "DS20191246Tumor"; gse229413_list_filt$GSM7277528$Type <- "Tumor"
+gse229413_list_filt$GSM7277529$Patient <-  "DS20191238Tumor"; gse229413_list_filt$GSM7277529$Type <- "Tumor"
+gse229413_list_filt$GSM7277530$Patient <-  "DS20191229Tumor"; gse229413_list_filt$GSM7277530$Type <- "Tumor"
+gse229413_list_filt$GSM7277531$Patient <-  "DS20191253Tumor"; gse229413_list_filt$GSM7277531$Type <- "Tumor"
+gse229413_list_filt$GSM7277532$Patient <-  "DS20191258PancNorm"; gse229413_list_filt$GSM7277532$Type <- "Normal"
+gse229413_list_filt$GSM7277533$Patient <-  "DS20191261Tumor"; gse229413_list_filt$GSM7277533$Type <- "Tumor"
+gse229413_list_filt$GSM7277534$Patient <-  "DS20191261TumorKeller"; gse229413_list_filt$GSM7277534$Type <- "Tumor"
+gse229413_list_filt$GSM7277535$Patient <-  "DS20191262Tumor"; gse229413_list_filt$GSM7277535$Type <- "Tumor"
+gse229413_list_filt$GSM7277536$Patient <-  "DS20191294Tumor"; gse229413_list_filt$GSM7277536$Type <- "Tumor"
+gse229413_list_filt$GSM7277537$Patient <-  "DS20191296Tumor"; gse229413_list_filt$GSM7277537$Type <- "Tumor"
+gse229413_list_filt$GSM7277538$Patient <-  "DS20191299Tumor"; gse229413_list_filt$GSM7277538$Type <- "Tumor"
+gse229413_list_filt$GSM7277539$Patient <-  "DS20191302Tumor"; gse229413_list_filt$GSM7277539$Type <- "Tumor"
+gse229413_list_filt$GSM7277540$Patient <-  "DS20191306Tumor"; gse229413_list_filt$GSM7277540$Type <- "Tumor"
+gse229413_list_filt$GSM7277541$Patient <-  "DS20191307Tumor"; gse229413_list_filt$GSM7277541$Type <- "Tumor"
+gse229413_list_filt$GSM7277542$Patient <-  "DS20191314Tumor"; gse229413_list_filt$GSM7277527$Type <- "Tumor"
+
+# merge and check post-filter metrics
+gse229413_merge <- merge(x=gse229413_list_filt[[1]], y=gse229413_list_filt[-1])
+VlnPlot(gse229413_merge, features = c("nFeature_RNA", "nCount_RNA", "percent_MT"),
+        group.by = "orig.ident")
+
+# edit metadata
+gse229413_merge@meta.data <- gse229413_merge@meta.data[, !grepl("^(DF\\.classifications|pANN)", 
+                                                                colnames(gse229413_merge@meta.data))]
+gse229413_merge$Project <- "GSE229413"
+gse229413_merge$sample_id <- paste(gse229413_merge$Project, gse229413_merge$orig.ident, 
+                                   gse229413_merge$Patient, sep = "_")
+gse229413_merge$Method <- "NovaSeq_6000"
+
+saveRDS(gse229413_merge, file.path(basedir, "mad_filt_stdNorm_decontX_Apr26/gse229413_apr26.RDS"))
+rm(gse229413_dir, gse229413_list, gse229413_list_filt)
+gc()
+
+################################################################################\
+
+seu <- gse229413_merge %>% NormalizeData() %>% FindVariableFeatures() %>% 
+  ScaleData() %>% RunPCA()
+
+pcs <- pc_cutoff(seu)
+
+res <- seq(0.1, 1, 0.1)
+seu <- seu %>% FindNeighbors(reduction = "pca", dims = 1:pcs) %>%
+  FindClusters(resolution = res, algorithm = 4)
+
+clustree(seu)
+
+Idents(seu) <- "RNA_snn_res.0.4" 
+
+seu <- RunUMAP(seu, reduction = "pca", dims = 1:pcs, 
+               reduction.name = "unintegrated")
+
+#DimPlot(seu, reduction = "unintegrated")
+DimPlot(seu, reduction = "unintegrated", 
+        group.by = c("RNA_snn_res.0.4", "sample_id"))
+
+rm(gse229413_merge, seu)
+gc()
+
+```
+
+
+### GSE242230
+
+```{r}
+# note: omitted GSM7755916 = adenosquamous carcinoma
+dir_gse242230 <- file.path(basedir, "GSE242230")
+filename <- list.dirs(dir_gse242230, recursive = F)
+filename <- filename[grep("GSM", filename)]
+
+gse242230_list <- vector("list", length = length(filename))
+names(gse242230_list) <- filename
+
+# Read in 10x data into a list
+for(i in filename){
+  gse242230_list[[i]] <- Read10X(data.dir = i)
+}
+names(gse242230_list) <- basename(names(gse242230_list))
+
+# Create Seurat objects in list
+for(i in names(gse242230_list)){
+  gse242230_list[[i]] <- CreateSeuratObject(counts = gse242230_list[[i]], 
+                                       project = names(gse242230_list[i]), 
+                                       min.cells = 3, min.features = 200)
+  gse242230_list[[i]] <- PercentageFeatureSet(gse242230_list[[i]], 
+                                              pattern = "^MT-",
+                                              col.name = "percent_MT")
+  gse242230_list[[i]] <- RenameCells(gse242230_list[[i]], add.cell.id = i)
+  gse242230_list[[i]] <- run_decontX(gse242230_list[[i]])
+}
+
+# check pre-filter metrics
+VlnPlot(merge(x=gse242230_list[[1]], y=gse242230_list[-1]), 
+        features = c("nFeature_RNA", "nCount_RNA", "percent_MT"))
+
+# Remove low-cell/quality samples 
+gse242230_list <- gse242230_list[names(gse242230_list) %in% 
+                                   c("GSM7755914", "GSM7755917", "GSM7755933",
+                                     "GSM7755923") == F]
+
+# merge and check post-filter metrics
+gse242230_list_filt <- lapply(gse242230_list, filt_sobj)
+
+
+gse242230_list_filt$GSM7755911$Stage <- "IV"; gse242230_list_filt$GSM7755911$tumor_loc <- "Body_Tail"
+gse242230_list_filt$GSM7755912$Stage <- "IIA"; gse242230_list_filt$GSM7755912$tumor_loc <- "Body_Tail"
+gse242230_list_filt$GSM7755913$Stage <- "IIB"; gse242230_list_filt$GSM7755913$tumor_loc <- "Body_Tail"
+#gse242230_list_filt$GSM7755914$Stage <- "IB"; gse242230_list_filt$GSM7755914$tumor_loc <- "Body_Tail"
+gse242230_list_filt$GSM7755915$Stage <- "IB"; gse242230_list_filt$GSM7755915$tumor_loc <- "Head_Neck_Uncinate" 
+#gse242230_list_filt$GSM7755916$Stage <- "IV"; gse242230_list_filt$GSM7755916$tumor_loc <- "Body_Tail"
+#gse242230_list_filt$GSM7755917$Stage <- "IB"; gse242230_list_filt$GSM7755917$tumor_loc <- "Head_Neck_Uncinate" 
+gse242230_list_filt$GSM7755918$Stage <- "IB"; gse242230_list_filt$GSM7755918$tumor_loc <- "Head_Neck_Uncinate"
+gse242230_list_filt$GSM7755919$Stage <- "IA"; gse242230_list_filt$GSM7755919$tumor_loc <- "Body_Tail" 
+gse242230_list_filt$GSM7755920$Stage <- "IIA"; gse242230_list_filt$GSM7755920$tumor_loc <- "Body_Tail"
+gse242230_list_filt$GSM7755921$Stage <- "IIA"; gse242230_list_filt$GSM7755921$tumor_loc <- "Body_Tail" 
+gse242230_list_filt$GSM7755922$Stage <- "IIB"; gse242230_list_filt$GSM7755922$tumor_loc <- "Head"
+gse242230_list_filt$GSM7755923$Stage <- "IIB"; gse242230_list_filt$GSM7755923$tumor_loc <- "Body"  
+gse242230_list_filt$GSM7755924$Stage <- "III"; gse242230_list_filt$GSM7755924$tumor_loc <- "Body"
+gse242230_list_filt$GSM7755925$Stage <- "III"; gse242230_list_filt$GSM7755925$tumor_loc <- "Uncinate" 
+gse242230_list_filt$GSM7755926$Stage <- "III"; gse242230_list_filt$GSM7755926$tumor_loc <- "Body"  
+gse242230_list_filt$GSM7755927$Stage <- "III"; gse242230_list_filt$GSM7755927$tumor_loc <- "Body"
+gse242230_list_filt$GSM7755928$Stage <- "IIB"; gse242230_list_filt$GSM7755928$tumor_loc <- "Neck"
+gse242230_list_filt$GSM7755929$Stage <- "III"; gse242230_list_filt$GSM7755929$tumor_loc <- "Uncinate"  
+gse242230_list_filt$GSM7755930$Stage <- "III"; gse242230_list_filt$GSM7755930$tumor_loc <- "Body"
+gse242230_list_filt$GSM7755931$Stage <- "IIB"; gse242230_list_filt$GSM7755931$tumor_loc <- "Head" 
+gse242230_list_filt$GSM7755932$Stage <- "IB"; gse242230_list_filt$GSM7755932$tumor_loc <- "Head"
+#gse242230_list_filt$GSM7755933$Stage <- "IIB"; gse242230_list_filt$GSM7755933$tumor_loc <- "Head_Uncinate" 
+gse242230_list_filt$GSM7755934$Stage <- "IB"; gse242230_list_filt$GSM7755934$tumor_loc <- "Uncinate"
+gse242230_list_filt$GSM7755935$Stage <- "IB"; gse242230_list_filt$GSM7755935$tumor_loc <- "Head"
+
+# merge and check post-filter QC
+gse242230_merge <- merge(x=gse242230_list_filt[[1]], y=gse242230_list_filt[-1])
+VlnPlot(gse242230_merge, features = c("nFeature_RNA", "nCount_RNA", "percent_MT"),
+        group.by = "orig.ident")
+
+# edit metadata
+gse242230_merge@meta.data <- gse242230_merge@meta.data[, !grepl("^(DF\\.classifications|pANN)", 
+                                                                colnames(gse242230_merge@meta.data))]
+gse242230_merge$Method <- "NovaSeq_6000"
+gse242230_merge$Project <- "GSE242230"
+gse242230_merge$sample_id <- paste(gse242230_merge$Project, gse242230_merge$orig.ident,
+                                   gse242230_merge$tumor_loc, gse242230_merge$Stage,
+                                   sep = "_")
+gse242230_merge$Type <- "Tumor"
+
+# # ### Remove low-cell/quality samples 
+# gse242230_merge <- subset(gse242230_merge,
+#                           subset = !orig.ident %in% "GSM7755923")
+
+#saveRDS(GSE242230, file.path(basedir, "std_norm_merged_singlets/lists/list_gse242230_singlets.RDS"))
+saveRDS(gse242230_merge, file.path(basedir,"mad_filt_stdNorm_decontX_Apr26/gse242230_apr26.RDS"))
+
+rm(dir_gse242230, gse242230_list, gse242230_list_filt)
+gc()
+
+################################################################################\
+
+seu <- gse242230_merge %>% NormalizeData() %>% FindVariableFeatures() %>% 
+  ScaleData() %>% RunPCA()
+
+pcs <- pc_cutoff(seu)
+
+res <- seq(0.1, 1, 0.1)
+seu <- seu %>% FindNeighbors(reduction = "pca", dims = 1:pcs) %>%
+  FindClusters(resolution = res, algorithm = 4)
+
+clustree(seu)
+
+Idents(seu) <- "RNA_snn_res.0.6" 
+
+seu <- RunUMAP(seu, reduction = "pca", dims = 1:pcs, 
+                           reduction.name = "unintegrated")
+
+DimPlot(seu, reduction = "unintegrated", group.by = c("RNA_snn_res.0.6", "sample_id"))
+
+rm(seu, gse242230_merge)
+gc()
+```
+
+
+### PRJCA001063
+
+```{r include=FALSE}
+# Data from https://zenodo.org/record/3969339#.YgORVfhUtaY
+dir_prjca001063 <- file.path(basedir,"PRJCA001063")
+# Convert(file.path(dir_prjca001063, "StdWf1_PRJCA001063_CRC_besca2.annotated.h5ad"), dest="h5seurat", overwrite=TRUE)
+# hoge_anno <- LoadH5Seurat("StdWf1_PRJCA001063_CRC_besca2.annotated.h5seurat")
+PRJCA001063 <- readRDS(file.path(dir_prjca001063, "StdWf1_PRJCA001063_CRC_besca2.raw.RDS")) %>%
+  UpdateSeuratObject()
+PRJCA001063[["RNA"]] <- as(PRJCA001063[["RNA"]], Class = "Assay5")
+
+calcn <- .CalcN(PRJCA001063[["RNA"]])
+PRJCA001063$nCount_RNA <- calcn$nCount
+PRJCA001063$nFeature_RNA <- calcn$nFeature
+PRJCA001063 <- PercentageFeatureSet(PRJCA001063, pattern = "^MT-", col.name = "percent_mito")
+
+PRJCA001063$Patient2 <- paste0("PRJCA001063_", PRJCA001063$Patient)
+
+#PRJCA001063[["RNA"]] <- split(PRJCA001063[["RNA"]], f = PRJCA001063$Patient2)
+
+
+# VlnPlot(PRJCA001063,
+#           features = c("nFeature_RNA", "nCount_RNA", "percent_mito"),
+#           ncol = 3, pt.size = 0.05,
+#           layer = "counts")
+
+# PRJCA001063 <- subset(PRJCA001063, subset = nCount_RNA < 80000 & nFeature_RNA > 500 & nFeature_RNA < 8000)
+
+PRJCA001063 <- RenameCells(PRJCA001063, add.cell.id = "PRJCA001063")
+
+PRJCA001063_list <- SplitObject(PRJCA001063, split.by = "Patient2")
+# for (i in names(PRJCA001063_list)) {
+#   PRJCA001063_list[[i]] <- run_decontX(PRJCA001063_list[[i]])
+# }
+
+PRJCA001063_list2 <- lapply(PRJCA001063_list, filt_sobj)
+
+
+PRJCA001063 <- merge(PRJCA001063_list2[[1]], PRJCA001063_list2[-1])
+
+## Edit meta data
+# Normal or Tumor
+PRJCA001063$Type <- plyr::mapvalues(x = PRJCA001063$Type,
+                                 from = c("N","T"),
+                                 to = c("Normal", "Tumor"))
+# dataset name
+PRJCA001063$Project <- "PRJCA001063"
+
+# dataset name + patient ID
+PRJCA001063$Patient2 <- paste("PRJCA001063",PRJCA001063$Patient, sep = "_")
+
+PRJCA001063$CONDITION <- NULL
+PRJCA001063$Method <- "HiSeq_XTen"
+
+#PRJCA001063 <- RenameCells(PRJCA001063, add.cell.id = "PRJCA001063")
+
+#saveRDS(PRJCA001063_list, file = file.path(basedir, "std_norm_merged_singlets/lists/list_prjca001063_singlets.rds"))
+saveRDS(PRJCA001063, file = file.path(basedir, "Feb26_preprocessed_decontX/merged_prjca001063_singlets_decontX_Feb26.RDS"))
+
+```
+
+
+
+### Meghna's scRNA
+
+```{r}
+
+meg_dir <- file.path(basedir, "scFFPE_Meghna")
+filename <- list.files(meg_dir, pattern = "feature_bc_matrix", full.names = T)
+
+meg_list <- vector("list", length = length(filename))
+names(meg_list) <- filename
+
+for (i in names(meg_list)) {
+  meg_list[[i]] <- Read10X_h5(filename = i)
+}
+names(meg_list) <- basename(names(meg_list)) %>%
+  tstrsplit("_", keep = 1) %>% unlist()
+
+# Create Seurat objects in list
+for(i in names(meg_list)){
+  meg_list[[i]] <- CreateSeuratObject(counts = meg_list[[i]], 
+                                 project = names(meg_list[i]), 
+                                 min.cells = 3, min.features = 200)
+  meg_list[[i]] <- PercentageFeatureSet(meg_list[[i]], pattern = "^MT-", col.name = "percent_MT")
+  meg_list[[i]] <- RenameCells(meg_list[[i]], add.cell.id = i)
+  meg_list[[i]] <- run_decontX(meg_list[[i]])
+}
+
+# check pre-filter metrics
+VlnPlot(merge(x=meg_list[[1]], y=meg_list[-1]), 
+        features = c("nFeature_RNA", "nCount_RNA", "percent_MT"))
+
+meg_list <- lapply(meg_list, filt_sobj)
+
+meg_merged <- merge(meg_list[[1]], meg_list[-1])
+VlnPlot(meg_merged, features = c("nFeature_RNA", "nCount_RNA", "percent_MT"),
+        group.by = "orig.ident")
+
+
+## edit meta data
+meg_merged@meta.data <- meg_merged@meta.data[, !grepl("^(DF\\.classifications|pANN)", 
+                                                      colnames(meg_merged@meta.data))]
+meg_merged$Project <- "Meg"
+meg_merged$Type <- "Tumor"
+meg_merged$sample_id <- paste(meg_merged$Project, meg_merged$orig.ident, sep = "_")
+meg_merged$Method <- "NextSeq_2000"
+
+saveRDS(meg_merged, file = file.path(basedir, "mad_filt_stdNorm_decontX_Apr26/meg_apr26.RDS"))
+rm(meg_dir, meg_list)
+gc()
+
+################################################################################
+
+seu <- meg_merged %>% NormalizeData() %>% FindVariableFeatures() %>% 
+  ScaleData() %>% RunPCA()
+
+pcs <- pc_cutoff(seu)
+
+res <- seq(0.1, 1, 0.1)
+seu <- seu %>% FindNeighbors(reduction = "pca", dims = 1:pcs) %>%
+  FindClusters(resolution = res, algorithm = 4)
+
+clustree(seu)
+
+
+Idents(seu) <- "RNA_snn_res.0.5" 
+
+seu <- RunUMAP(seu, reduction = "pca", dims = 1:pcs, 
+               reduction.name = "unintegrated")
+
+#DimPlot(seu, reduction = "unintegrated")
+DimPlot(seu, reduction = "unintegrated", 
+        group.by = c("RNA_snn_res.0.5", "sample_id"))
+
+rm(meg_merged, seu)
+gc()
+```
+
